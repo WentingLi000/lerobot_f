@@ -71,7 +71,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
-) -> tuple[MetricsTracker, dict]:
+) -> tuple[MetricsTracker, dict, bool]:
     """
     Performs a single training step to update the policy's weights.
 
@@ -93,6 +93,7 @@ def update_policy(
         A tuple containing:
         - The updated MetricsTracker with new statistics for this step.
         - A dictionary of outputs from the policy's forward pass, for logging purposes.
+        - Whether an optimizer update was performed on this micro-batch.
     """
     start_time = time.perf_counter()
     policy.train()
@@ -103,56 +104,79 @@ def update_policy(
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
-            # Get per-sample losses
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+    optimizer_updated = False
 
-            # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
-            # rabc_batch_weights is already normalized to sum to batch_size
-            epsilon = 1e-6
-            loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-            # Log raw mean weight (before normalization) - this is the meaningful metric
-            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-        else:
-            loss, output_dict = policy.forward(batch)
+    with accelerator.accumulate(policy):
+        # Let accelerator handle mixed precision
+        with accelerator.autocast():
+            # Use per-sample loss when RA-BC is enabled for proper weighting
+            if rabc_batch_weights is not None:
+                # Get per-sample losses
+                per_sample_loss, output_dict = policy.forward(batch, reduction="none")
 
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+                # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
+                # rabc_batch_weights is already normalized to sum to batch_size
+                epsilon = 1e-6
+                loss = (per_sample_loss * rabc_batch_weights).sum() / (
+                    rabc_batch_weights.sum() + epsilon
+                )
+                # Log raw mean weight (before normalization) - this is the meaningful metric
+                output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+                output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+                output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            else:
+                loss, output_dict = policy.forward(batch)
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+            # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+        # Use accelerator's backward method. Accelerator scales the loss for gradient accumulation.
+        accelerator.backward(loss)
+        grad_norm = torch.zeros((), device=loss.device)
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+        # Previous non-accumulation behavior, kept for reference:
+        # if grad_clip_norm > 0:
+        #     grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        # else:
+        #     grad_norm = torch.nn.utils.clip_grad_norm_(
+        #         policy.parameters(), float("inf"), error_if_nonfinite=False
+        #     )
+        # with lock if lock is not None else nullcontext():
+        #     optimizer.step()
+        # optimizer.zero_grad()
+        # if lr_scheduler is not None:
+        #     lr_scheduler.step()
+        # if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+        #     accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    optimizer.zero_grad()
+        if accelerator.sync_gradients:
+            # Clip gradients only when accumulated gradients are about to be applied.
+            if grad_clip_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), float("inf"), error_if_nonfinite=False
+                )
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+            with lock if lock is not None else nullcontext():
+                optimizer.step()
 
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+            optimizer.zero_grad()
+
+            # Step through pytorch scheduler at every optimizer update instead of every micro-batch.
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            # Update internal buffers if policy has update method
+            if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+                accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+
+            optimizer_updated = True
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
-    return train_metrics, output_dict
+    return train_metrics, output_dict, optimizer_updated
 
 
 @parser.wrap()
@@ -192,6 +216,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
+            gradient_accumulation_steps=cfg.gradient_accumulation_steps, #minor patch gradient_accumulation_steps=cfg.gradient_accumulation_steps
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
         )
@@ -359,8 +384,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        #effective_bs = cfg.batch_size * num_processes
+        #logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * num_processes * cfg.gradient_accumulation_steps
+        logging.info(
+            f"Effective batch size: {cfg.batch_size} x {num_processes} x "
+            f"{cfg.gradient_accumulation_steps} = {effective_bs}"
+        ) #minor patch: add gradient_accumulation_steps
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -408,7 +438,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     }
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    #effective_batch_size = cfg.batch_size * accelerator.num_processes
+    effective_batch_size = (cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps)#minor patch: add cfg.gradient_accumulation_steps
     train_tracker = MetricsTracker(
         cfg.batch_size,
         dataset.num_frames,
@@ -431,7 +462,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    # Previous non-accumulation behavior, kept for reference:
+    # for _ in range(step, cfg.steps):
+    while step < cfg.steps:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -440,7 +473,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
+        train_tracker, output_dict, optimizer_updated = update_policy(
             train_tracker,
             policy,
             batch,
@@ -450,6 +483,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
         )
+
+        if not optimizer_updated:
+            continue
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
