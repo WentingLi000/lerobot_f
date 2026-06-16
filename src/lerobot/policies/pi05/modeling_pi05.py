@@ -695,7 +695,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             max_period=self.config.max_period,
             device=timestep.device,
         )
-        time_emb = time_emb.type(dtype=timestep.dtype)
+        #minor patch: fixing reason same as below
+        #time_emb = time_emb.type(dtype=timestep.dtype)
+        time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
+
+        #minor patch:to fix the issue when using deepspeed:mat1 and mat2 must have the same dtype, but got Float and BFloat16
+        action_proj_dtype = self.action_in_proj.weight.dtype
+        noisy_actions = noisy_actions.to(dtype=action_proj_dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -774,14 +780,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        #suffix_out = suffix_out.to(dtype=torch.float32)
+        #minor patch: RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        #minor patch:Found dtype Float but expected BFloat16
+        target = u_t.to(dtype=v_t.dtype)
+        return F.mse_loss(target, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1170,9 +1180,19 @@ class PI05Policy(PreTrainedPolicy):
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
+            # # Ensure float32 dtype for consistency
+            # if img.dtype != torch.float32:
+            #     img = img.to(torch.float32)
+
+            # minor patch:Convert image pixels to float32 in [0, 1].
+            # LeRobot training datasets may return uint8 images in [0, 255].
+            if img.dtype == torch.uint8:
+                img = img.to(torch.float32) / 255.0
+            else:
                 img = img.to(torch.float32)
+                if img.max() > 1.0:
+                    img = img / 255.0
+
 
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
@@ -1269,8 +1289,12 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        # loss_dict = {
+        #     "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+        # }
+        #minor patch:TypeError: Got unsupported ScalarType BFloat16
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": losses.mean(dim=[0, 1]).detach().float().cpu().numpy().tolist(),
         }
 
         if reduction == "none":
