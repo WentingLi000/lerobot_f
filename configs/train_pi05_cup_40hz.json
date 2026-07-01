@@ -1,0 +1,56 @@
+{
+  "job_name": "pi05_cup_pGbs16_10k_accu_4_t1",
+  "output_dir": "outputs/train/pi05_cup_pGbs16_10k_accu_4_t1",
+
+  "dataset": {
+    "repo_id": "venteen/cup_40hz",
+    "root": "/hkfs/work/workspace/scratch/ujzmd-lerobot/hf_cache/lerobot/venteen/cup_40hz",
+    "return_uint8": true,
+    "streaming": false,
+    "use_imagenet_stats": true,
+    "video_backend": "torchcodec"
+  },
+
+"policy": {
+  "type": "pi05",
+  "pretrained_path": "/hkfs/work/workspace/scratch/ujzmd-lerobot/hf_cache/models/lerobot/pi05_base",
+  "push_to_hub": false,
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "use_amp": true,
+  "gradient_checkpointing": true,
+  "compile_model": false,
+  "train_expert_only": false,
+  "freeze_vision_encoder": false,
+
+  "optimizer_lr": 1e-4,
+  "optimizer_betas": [0.9, 0.95],
+  "optimizer_eps": 1e-8,
+  "optimizer_weight_decay": 0.01,
+  "optimizer_grad_clip_norm": 1.0,
+
+  "scheduler_warmup_steps": 1000,
+  "scheduler_decay_steps": 10000,
+  "scheduler_decay_lr": 1e-5
+},
+
+  "batch_size": 16,
+  "gradient_accumulation_steps": 4,
+  "steps": 10000,
+  "num_workers": 2,
+  "persistent_workers": true,
+
+
+  "log_freq": 10,
+  "save_checkpoint": true,
+  "save_freq": 2500,
+  "eval_freq": 200000,
+
+  "wandb": {
+  "enable": true,
+  "mode": "online",
+  "project": "lerobot_pi05",
+  "entity": "wentingli-kit",
+  "disable_artifact": true
+}
+}

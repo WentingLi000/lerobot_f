@@ -36,8 +36,10 @@ from tqdm import tqdm
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_training_step,
     load_training_state,
     save_checkpoint,
+    save_checkpoint_from_state_dict,
     update_last_checkpoint,
 )
 from lerobot.common.wandb_utils import WandBLogger
@@ -50,6 +52,7 @@ from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_proces
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.constants import TRAINING_STATE_DIR
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -59,6 +62,9 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+DEEPSPEED_STATE_DIR = "deepspeed_state"
 
 
 def update_policy(
@@ -173,7 +179,8 @@ def update_policy(
             optimizer_updated = True
 
     train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
+    #train_metrics.grad_norm = grad_norm.item()
+    train_metrics.grad_norm = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict, optimizer_updated
@@ -365,9 +372,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         )
 
     step = 0  # number of policy updates (forward + backward + optim)
+    deepspeed_state_dir = None
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        candidate_deepspeed_state_dir = cfg.checkpoint_path / DEEPSPEED_STATE_DIR
+        if candidate_deepspeed_state_dir.is_dir():
+            # DeepSpeed owns the wrapped model/optimizer/scheduler state. Remember the directory now and
+            # restore it after accelerator.prepare(...) has created the DeepSpeed engine below.
+            deepspeed_state_dir = candidate_deepspeed_state_dir
+        else:
+            step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -425,6 +439,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    if deepspeed_state_dir is not None:
+        # Restore the DeepSpeed-native training checkpoint into the wrapped objects. The small LeRobot
+        # training_state file stores the Python loop step so logging/saving resumes at the right count.
+        accelerator.load_state(str(deepspeed_state_dir))
+        step = load_training_step(cfg.checkpoint_path / TRAINING_STATE_DIR)
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -517,9 +537,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            if accelerator.distributed_type.name == "DEEPSPEED":
+                if is_main_process:
+                    logging.info(f"Checkpoint DeepSpeed state after step {step}")
+
+                # All ranks must participate. This directory is the checkpoint used to resume training.
+                accelerator.save_state(str(checkpoint_dir / DEEPSPEED_STATE_DIR))
+                accelerator.wait_for_everyone()
+
+                # Export the regular pretrained_model/model.safetensors used by eval and robot rollout.
+                # get_state_dict asks Accelerate/DeepSpeed to materialize normal tensors instead of saving
+                # DeepSpeed-managed parameter views directly.
+                state_dict = accelerator.get_state_dict(policy)
+                if is_main_process:
+                    logging.info(f"Export inference checkpoint after step {step}")
+                    save_checkpoint_from_state_dict(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        state_dict=state_dict,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+                del state_dict
+            elif is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,

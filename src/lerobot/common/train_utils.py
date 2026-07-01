@@ -15,6 +15,8 @@
 # limitations under the License.
 from pathlib import Path
 
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from safetensors.torch import save_file as save_safetensor_file
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -36,6 +38,14 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+
+
+def _clone_state_dict_tensors(state_dict: dict) -> dict:
+    """Detach tensors from shared/view storage before writing an inference-only checkpoint."""
+    return {
+        key: value.detach().clone().contiguous() if hasattr(value, "detach") else value
+        for key, value in state_dict.items()
+    }
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -112,6 +122,59 @@ def save_checkpoint(
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
     save_training_state(checkpoint_dir, step, optimizer, scheduler)
+
+
+def save_checkpoint_from_state_dict(
+    checkpoint_dir: Path,
+    step: int,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    state_dict: dict,
+    preprocessor: PolicyProcessorPipeline | None = None,
+    postprocessor: PolicyProcessorPipeline | None = None,
+) -> None:
+    """Save an eval/rollout checkpoint from an already consolidated model state_dict.
+
+    This path is used for DeepSpeed training. DeepSpeed may keep model parameters as views into
+    internal buffers, which can make ``policy.save_pretrained`` fail inside safetensors. Accelerate's
+    ``get_state_dict`` asks DeepSpeed to provide normal tensors first; this function then writes those
+    tensors into the same ``pretrained_model/model.safetensors`` layout used by eval and rollout.
+
+    The full resume-training state is saved separately with ``accelerator.save_state``. This helper only
+    exports the portable policy checkpoint plus lightweight metadata.
+    """
+    pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    pretrained_dir.mkdir(parents=True, exist_ok=True)
+
+    policy.config._save_pretrained(pretrained_dir)
+    cfg.save_pretrained(pretrained_dir)
+    if cfg.peft is not None:
+        policy.config.save_pretrained(pretrained_dir)
+    if preprocessor is not None:
+        preprocessor.save_pretrained(pretrained_dir)
+    if postprocessor is not None:
+        postprocessor.save_pretrained(pretrained_dir)
+
+    try:
+        save_safetensor_file(
+            state_dict,
+            str(pretrained_dir / SAFETENSORS_SINGLE_FILE),
+            metadata={"format": "pt"},
+        )
+    except RuntimeError as e:
+        if "share memory" not in str(e) and "storage" not in str(e):
+            raise
+        # This file is only the eval/rollout export. Cloning here avoids safetensors storage-view
+        # failures without changing the DeepSpeed-native checkpoint used for resume training.
+        save_safetensor_file(
+            _clone_state_dict_tensors(state_dict),
+            str(pretrained_dir / SAFETENSORS_SINGLE_FILE),
+            metadata={"format": "pt"},
+        )
+
+    # Optimizer/scheduler live in the DeepSpeed checkpoint. Keep the LeRobot step/RNG metadata here so
+    # existing config resume logic can still recover the loop step from training_state/training_step.json.
+    save_training_state(checkpoint_dir, step, optimizer=None, scheduler=None)
 
 
 def save_training_state(
