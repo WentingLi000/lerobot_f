@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import matplotlib
 
@@ -17,21 +18,42 @@ class PI05AttentionLogger:
     _QKV_RE = re.compile(r"layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj)$")
     _SELF_ATTN_RE = re.compile(r"layers\.(\d+)\.self_attn$")
 
-    def __init__(self, output_dir, layers=None, save_heatmaps=True):
+    def __init__(
+        self,
+        output_dir,
+        layers=None,
+        save_heatmaps=True,
+        save_debug_artifacts=True,
+        save_overlays=True,
+        overlay_layers=None,
+        overlay_denoise_steps=None,
+        overlay_image_names=None,
+    ):
         self.output_dir = Path(output_dir)
         self.layers = None if layers is None else {int(layer) for layer in layers}
         self.save_heatmaps = save_heatmaps
+        self.save_debug_artifacts = save_debug_artifacts
+        self.save_overlays = save_overlays
+        self.overlay_layers = None if overlay_layers is None else {int(layer) for layer in overlay_layers}
+        self.overlay_denoise_steps = (
+            None if overlay_denoise_steps is None else {int(step) for step in overlay_denoise_steps}
+        )
+        self.overlay_image_names = None if overlay_image_names is None else {str(name) for name in overlay_image_names}
         self.handles = []
         self.self_attn_modules = {}
         self.current_event = None
         self.current_stage = None
         self.current_denoise_step = None
         self.current_time = None
+        self.current_save_overlays = True
         self.prefix_layout = []
         self.action_token_count = None
+        self.image_feature_names = []
+        self.current_images = {}
         self.records = []
         self.step_index_path = self.output_dir / "events.jsonl"
         self.feature_scores_path = self.output_dir / "feature_scores.jsonl"
+        self.camera_reliance_path = self.output_dir / "camera_reliance.jsonl"
         self._modeling_gemma = None
         self._original_eager_attention_forward = None
 
@@ -39,6 +61,8 @@ class PI05AttentionLogger:
         self.close()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.self_attn_modules = {}
+        self.image_feature_names = list(getattr(policy.config, "image_features", {}).keys())
+        self._save_image_mapping()
         for name, module in policy.named_modules():
             attn_match = self._SELF_ATTN_RE.search(name)
             if attn_match is not None:
@@ -69,13 +93,15 @@ class PI05AttentionLogger:
         self._modeling_gemma = None
         self._original_eager_attention_forward = None
 
-    def begin_step(self, *, episode, local_t, sample_idx, task=None):
+    def begin_step(self, *, episode, local_t, sample_idx, task=None, images=None, save_overlays=None):
         self.current_event = {
             "episode": int(episode),
             "local_t": int(local_t),
             "sample_idx": int(sample_idx),
             "task": _to_jsonable(task),
         }
+        self.current_save_overlays = self.save_overlays if save_overlays is None else bool(save_overlays)
+        self.current_images = _clone_images(images or {})
         self.records = []
 
     def set_stage(self, stage=None, denoise_step=None, time=None):
@@ -104,26 +130,33 @@ class PI05AttentionLogger:
         )
         step_dir.mkdir(parents=True, exist_ok=True)
 
-        tensor_path = step_dir / "qkv_records.pt"
-        torch.save({"event": self.current_event, "records": self.records}, tensor_path)
+        tensor_path = None
+        if self.save_debug_artifacts:
+            tensor_path = step_dir / "qkv_records.pt"
+            torch.save({"event": self.current_event, "records": self.records}, tensor_path)
 
         heatmap_paths = []
-        if self.save_heatmaps:
+        if self.save_heatmaps and (self.save_debug_artifacts or self.current_save_overlays):
             heatmap_paths = self._save_heatmaps(step_dir)
         feature_scores = self._save_feature_scores()
+        camera_reliance = self._save_camera_reliance(feature_scores)
 
         event = {
             **self.current_event,
+            "image_mapping": self._image_mapping(),
             "num_qkv_records": len(self.records),
-            "tensor_path": str(tensor_path),
+            "tensor_path": None if tensor_path is None else str(tensor_path),
             "heatmap_paths": [str(path) for path in heatmap_paths],
             "num_feature_scores": len(feature_scores),
+            "num_camera_reliance": len(camera_reliance),
         }
         with self.step_index_path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(event) + "\n")
 
         self.current_event = None
         self.set_stage()
+        self.current_save_overlays = True
+        self.current_images = {}
         self.records = []
 
     def _patch_eager_attention_forward(self):
@@ -224,13 +257,18 @@ class PI05AttentionLogger:
             )
             if heatmap is None:
                 continue
-            safe_name = record["module"].replace(".", "_")
-            stage = record.get("stage") or "unknown"
-            denoise_step = record.get("denoise_step")
-            step_suffix = "prefix" if denoise_step is None else f"denoise_{denoise_step:02d}"
-            path = step_dir / f"{index:04d}_{stage}_{step_suffix}_{safe_name}_real_attention.png"
-            _plot_heatmap(heatmap, path, title=f"{record['module']} {stage} {step_suffix}")
-            paths.append(path)
+            if self.save_debug_artifacts:
+                safe_name = record["module"].replace(".", "_")
+                stage = record.get("stage") or "unknown"
+                denoise_step = record.get("denoise_step")
+                step_suffix = "prefix" if denoise_step is None else f"denoise_{denoise_step:02d}"
+                path = step_dir / f"{index:04d}_{stage}_{step_suffix}_{safe_name}_real_attention.png"
+                _plot_heatmap(heatmap, path, title=f"{record['module']} {stage} {step_suffix}")
+                paths.append(path)
+            paths.extend(self._save_denoise_camera_overlays(record, heatmap, step_dir, index))
+
+        if not self.save_debug_artifacts:
+            return paths
 
         grouped = {}
         for record in self.records:
@@ -283,6 +321,17 @@ class PI05AttentionLogger:
                 "key_layout": key_layout,
                 "scores": scores,
             }
+            per_head = _real_attention_by_head(
+                record["q"],
+                record["k"],
+                record["attention_mask"],
+                record["scaling"],
+            )
+            if per_head is not None:
+                row["per_head_scores"] = [
+                    _aggregate_feature_scores(head_heatmap, query_layout, key_layout)
+                    for head_heatmap in per_head
+                ]
             rows.append(row)
 
         if rows:
@@ -290,6 +339,108 @@ class PI05AttentionLogger:
                 for row in rows:
                     fp.write(json.dumps(row) + "\n")
         return rows
+
+    def _save_camera_reliance(self, feature_scores):
+        rows = []
+        for row in feature_scores:
+            if row.get("stage") != "denoise":
+                continue
+            scores = row.get("scores", {})
+            image_scores = {}
+            for image_item in self._image_layout_items(row.get("key_layout", [])):
+                key = f"action_tokens->{image_item['name']}"
+                if key not in scores:
+                    continue
+                token_count = int(image_item["end"]) - int(image_item["start"])
+                image_scores[image_item["name"]] = {
+                    "camera_key": self._camera_key_for_image_name(image_item["name"]),
+                    "mean_attention": float(scores[key]),
+                    "token_count": token_count,
+                    "attention_mass": float(scores[key]) * token_count,
+                }
+            if not image_scores:
+                continue
+            out_row = {
+                **self.current_event,
+                "module": row["module"],
+                "layer_idx": row["layer_idx"],
+                "denoise_step": row.get("denoise_step"),
+                "time": row.get("time"),
+                "image_mapping": self._image_mapping(),
+                "image_scores": image_scores,
+            }
+            rows.append(out_row)
+
+        if rows:
+            with self.camera_reliance_path.open("a", encoding="utf-8") as fp:
+                for row in rows:
+                    fp.write(json.dumps(row) + "\n")
+        return rows
+
+    def _save_denoise_camera_overlays(self, record, heatmap, step_dir, record_index):
+        if not self.current_save_overlays:
+            return []
+        if record.get("stage") != "denoise":
+            return []
+        if self.overlay_layers is not None and int(record["layer_idx"]) not in self.overlay_layers:
+            return []
+        denoise_step = record.get("denoise_step")
+        if self.overlay_denoise_steps is not None:
+            if denoise_step is None or int(denoise_step) not in self.overlay_denoise_steps:
+                return []
+
+        query_layout, key_layout = self._layouts_for_record(record, heatmap)
+        query_item = next((item for item in query_layout if item["name"] == "action_tokens"), None)
+        if query_item is None:
+            return []
+
+        q0, q1 = query_item["start"], query_item["end"]
+        if q1 <= q0:
+            return []
+
+        paths = []
+        step_suffix = "unknown" if denoise_step is None else f"{int(denoise_step):02d}"
+
+        for image_item in self._image_layout_items(key_layout):
+            image_name = image_item["name"]
+            if self.overlay_image_names is not None and image_name not in self.overlay_image_names:
+                continue
+            k0, k1 = image_item["start"], image_item["end"]
+            token_count = k1 - k0
+            grid_size = int(math.sqrt(token_count))
+            if grid_size * grid_size != token_count:
+                continue
+
+            camera_key = self._camera_key_for_image_name(image_name)
+            raw_image = self.current_images.get(camera_key)
+            if raw_image is None:
+                continue
+
+            patch_scores = heatmap[q0:q1, k0:k1].mean(dim=0).reshape(grid_size, grid_size)
+            safe_module = record["module"].replace(".", "_")
+            safe_camera = camera_key.replace(".", "_").replace("/", "_")
+            out_path = step_dir / (
+                f"{record_index:04d}_denoise_{step_suffix}_layer_{record['layer_idx']}_"
+                f"{image_name}_{safe_camera}_action_attention_overlay.png"
+            )
+            _plot_patch_overlay(raw_image, patch_scores, out_path, title=f"{camera_key} {safe_module}")
+            paths.append(out_path)
+
+            tensor_path = out_path.with_suffix(".pt")
+            torch.save(
+                {
+                    "camera_key": camera_key,
+                    "image_name": image_name,
+                    "layer_idx": record["layer_idx"],
+                    "stage": record.get("stage"),
+                    "denoise_step": denoise_step,
+                    "patch_scores": patch_scores.detach().cpu(),
+                },
+                tensor_path,
+            )
+            paths.append(tensor_path)
+
+        return paths
 
     def _layouts_for_record(self, record, heatmap):
         q_len = int(heatmap.shape[0])
@@ -310,8 +461,41 @@ class PI05AttentionLogger:
 
         return [], []
 
+    def _image_mapping(self):
+        return {
+            f"image_{idx}": key
+            for idx, key in enumerate(self.image_feature_names)
+        }
+
+    def _save_image_mapping(self):
+        if not self.image_feature_names:
+            return
+        path = self.output_dir / "image_mapping.json"
+        with path.open("w", encoding="utf-8") as fp:
+            json.dump(self._image_mapping(), fp, indent=2)
+
+    def _camera_key_for_image_name(self, image_name):
+        match = re.fullmatch(r"image_(\d+)", image_name)
+        if match is None:
+            return image_name
+        image_idx = int(match.group(1))
+        if 0 <= image_idx < len(self.image_feature_names):
+            return self.image_feature_names[image_idx]
+        return image_name
+
+    def _image_layout_items(self, layout):
+        return [item for item in layout if re.fullmatch(r"image_\d+", item["name"]) is not None]
+
 
 def _real_attention_heatmap(q_tensor, k_tensor, attention_mask, scaling):
+    per_head = _real_attention_by_head(q_tensor, k_tensor, attention_mask, scaling)
+    if per_head is None:
+        return None
+    return per_head.mean(dim=0)
+
+
+def _real_attention_by_head(q_tensor, k_tensor, attention_mask, scaling):
+    """Return real masked attention as [num_query_heads, q_len, k_len]."""
     if q_tensor.ndim != 4 or k_tensor.ndim != 4:
         return None
     if q_tensor.shape[0] != 1 or k_tensor.shape[0] != 1:
@@ -326,7 +510,7 @@ def _real_attention_heatmap(q_tensor, k_tensor, attention_mask, scaling):
     if attention_mask is not None:
         scores = scores + attention_mask
     attn = torch.softmax(scores, dim=-1)
-    return attn[0].mean(dim=0)
+    return attn[0]
 
 
 def _aggregate_feature_scores(heatmap, query_layout, key_layout):
@@ -386,6 +570,61 @@ def _plot_heatmap(heatmap, path, title):
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _clone_images(images):
+    cloned = {}
+    for key, value in images.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.detach().cpu()
+    return cloned
+
+
+def _image_to_chw_float(image):
+    image = image.detach().cpu()
+    if image.ndim == 4:
+        image = image[0]
+    if image.ndim != 3:
+        return None
+    if image.shape[0] in (1, 3, 4):
+        chw = image[:3].to(torch.float32)
+    elif image.shape[-1] in (1, 3, 4):
+        chw = image[..., :3].permute(2, 0, 1).to(torch.float32)
+    else:
+        return None
+    if chw.max() > 1.0:
+        chw = chw / 255.0
+    if chw.min() < 0.0:
+        chw = (chw + 1.0) / 2.0
+    return chw.clamp(0.0, 1.0)
+
+
+def _plot_patch_overlay(raw_image, patch_scores, path, title):
+    image = _image_to_chw_float(raw_image)
+    if image is None:
+        return
+
+    heatmap = patch_scores.detach().cpu().to(torch.float32)
+    heatmap = heatmap - heatmap.min()
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+
+    heatmap = F.interpolate(
+        heatmap[None, None],
+        size=tuple(image.shape[-2:]),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(image.permute(1, 2, 0).numpy())
+    im = ax.imshow(heatmap.numpy(), cmap="magma", alpha=0.45, vmin=0.0, vmax=1.0)
+    ax.set_title(title, fontsize=8)
+    ax.axis("off")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
     plt.close(fig)
 
 

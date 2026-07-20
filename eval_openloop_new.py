@@ -119,16 +119,13 @@ def validate_policy_features(policy, sample, dataset_stats):
 # Config
 # =========================
 
-# ckpt_dir = "outputs/train/pi05_lemon_bowl_224_pGbs8_20k_accu_4_t1/checkpoints/020000/pretrained_model"
-ckpt_dir = "outputs/train/pi05_lemon_bowl_224_pGbs8_20k_accu_4_t1/checkpoints/002500/pretrained_model"
-# ckpt_dir = "outputs/train/pi05_lemon_bowl_pGbs4_1k_t2/checkpoints/001000/pretrained_model"
-# ckpt_dir = "outputs/train/pi05_lemon_bowl_pGbs8_20k_accu_4_t2/checkpoints/010000/pretrained_model"
+# ckpt_dir = "outputs/train/pi05_lemon_bowl_4_4_4_3_cameras_10k/checkpoints/005000/pretrained_model"
+ckpt_dir = "outputs/train/pi05_lemon_bowl_dynamic_8_4_4_wrist_opst_10k/checkpoints/005000/pretrained_model"
 
-# config_path = "configs/train_pi05_lemon_bowl_25hz_wrist_side_interactive.json"
-config_path = "configs/train_pi05_lemon_bowl_25hz_wrist_side_latest.json"
+# config_path = "configs/train_pi05_lemon_bowl_dynamic_wrist_opst.json"
+config_path = "configs/train_pi05_lemon_bowl_dynamic_wrist_opst.json"
 
-# plot_dir = "openloop_eval/pi05_lemon_bowl_pGbs8_20k_accu_4_t2"
-plot_dir = "openloop_eval/pi05_lemon_bowl_224_844_2_5k"
+plot_dir = "openloop_eval/pi05_lemon_bowl_dynamic/pi05_lemon_dynamic_wrist_opst_844_5k"
 
 os.makedirs(plot_dir, exist_ok=True)
 
