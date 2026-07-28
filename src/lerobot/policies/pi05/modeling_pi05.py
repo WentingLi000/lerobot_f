@@ -20,7 +20,7 @@ import logging
 import math
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -681,6 +681,71 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
+    def compute_prefix_cache(self, images, img_masks, tokens, masks) -> dict[str, Any]:
+        """Embed prefix inputs and build the reusable PI0.5 KV cache."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            tokens,
+            masks,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(
+            prefix_pad_masks,
+            prefix_att_masks,
+        )
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
+            prefix_att_2d_masks
+        )
+
+        paligemma = self.paligemma_with_expert.paligemma
+        language_model = paligemma.model.language_model
+        previous_training = paligemma.training
+        previous_gradient_checkpointing = getattr(
+            language_model,
+            "gradient_checkpointing",
+            None,
+        )
+        previous_attention_implementation = getattr(
+            language_model.config,
+            "_attn_implementation",
+            None,
+        )
+        try:
+            paligemma.eval()
+            if previous_gradient_checkpointing is not None:
+                language_model.gradient_checkpointing = False
+            language_model.config._attn_implementation = "eager"
+            with torch.no_grad():
+                prefix_outputs, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks_4d,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    use_cache=True,
+                )
+        finally:
+            paligemma.train(previous_training)
+            if previous_gradient_checkpointing is not None:
+                language_model.gradient_checkpointing = previous_gradient_checkpointing
+            if previous_attention_implementation is not None:
+                language_model.config._attn_implementation = (
+                    previous_attention_implementation
+                )
+
+        if past_key_values is None:
+            raise RuntimeError("PI0.5 prefix forward did not return a KV cache.")
+        return {
+            "prefix_outputs": prefix_outputs,
+            "past_key_values": past_key_values,
+            "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
+        }
+
+    def make_att_2d_masks(self, pad_masks, att_masks):
+        """Expose the model's canonical attention-mask construction."""
+        return make_att_2d_masks(pad_masks, att_masks)
+
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -810,20 +875,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        prefix_cache = self.compute_prefix_cache(images, img_masks, tokens, masks)
+        prefix_pad_masks = prefix_cache["prefix_pad_masks"]
+        past_key_values = prefix_cache["past_key_values"]
 
         dt = -1.0 / num_steps
 
