@@ -33,17 +33,20 @@ REPO_ROOT = Path(__file__).resolve().parent
 # -----------------------------------------------------------------------------
 # Experiment configuration
 # -----------------------------------------------------------------------------
-CKPT_DIR = "outputs/train/pi05_lemon_bowl_4_4_4_3_cameras_10k/checkpoints/007500/pretrained_model"
+CKPT_DIR = "outputs/train/pi05_lemon_bowl_dynamic_8_4_4_wrist_opst_lr5e05_10k/checkpoints/010000/pretrained_model"
 # Use the checkpoint's exact training config to prevent a dataset/config mismatch.
 CONFIG_PATH = f"{CKPT_DIR}/train_config.json"
-OUTPUT_DIR = "openloop_eval/n_step_analysis/pi05_lemon_bowl_4_4_4_3_cameras_007500_n_step"
+OUTPUT_DIR = "openloop_eval/n_step_analysis_2/pi05_lemon_bowl_dynamic_8_4_4_wrist_opst_lr5e05_10k"
 
-N_STEP_SIZES = [5, 10, 15, 20, 30]
-NUM_EPISODES = 1
+N_STEP_SIZES = [2, 5, 10]
+NUM_EPISODES = 30
+NUM_VISUALIZATION_EPISODES = 5
+REQUIRED_EPISODES = [6, 28, 163]
 RANDOM_SEED = 42
 
 ENABLE_ATTENTION_LOG = True
 ATTENTION_LAYERS = list(range(18))
+EXPECTED_ATTENTION_HEADS = 8
 TIME_PLOT_LAYER = 17
 # Log every planning call. Changing this would sample different calls per horizon.
 ATTENTION_INFERENCE_STRIDE = 1
@@ -291,6 +294,63 @@ def load_denoise_attention_rows(path):
     return rows
 
 
+def write_attention_score_tables(rows, output_dir):
+    """Write unambiguous per-token, mass, normalized-mass and overall tables."""
+    if not rows:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    modalities = attention_modalities(rows)
+    per_token = defaultdict(lambda: defaultdict(list))
+    mass = defaultdict(lambda: defaultdict(list))
+    normalized = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        layer = int(row["layer_idx"])
+        layout = {item["name"]: item for item in row.get("key_layout", [])}
+        row_masses = {}
+        for modality in modalities:
+            key = f"action_tokens->{modality}"
+            if key not in row.get("scores", {}) or modality not in layout:
+                continue
+            mean_value = float(row["scores"][key])
+            token_count = int(layout[modality]["end"]) - int(layout[modality]["start"])
+            mass_value = mean_value * token_count
+            per_token[layer][modality].append(mean_value)
+            mass[layer][modality].append(mass_value)
+            row_masses[modality] = mass_value
+        total = sum(row_masses.values())
+        if total > 0:
+            for modality, value in row_masses.items():
+                normalized[layer][modality].append(value / total)
+
+    def mean(values):
+        return sum(values) / len(values) if values else 0.0
+
+    def write_layer_table(path, values):
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write("layer\t" + "\t".join(modalities) + "\n")
+            for layer in ATTENTION_LAYERS:
+                fields = [f"{mean(values[layer][name]):.10f}" for name in modalities]
+                handle.write(f"{layer}\t" + "\t".join(fields) + "\n")
+
+    write_layer_table(output_dir / "mean_action_attention_per_token_by_layer.txt", per_token)
+    write_layer_table(output_dir / "mean_action_attention_mass_by_layer.txt", mass)
+    write_layer_table(output_dir / "mean_action_attention_by_layer_normalized.txt", normalized)
+
+    with (output_dir / "overall_mean_action_attention.txt").open("w", encoding="utf-8") as handle:
+        handle.write("modality\tmean_mass\tnormalized_share\n")
+        modality_masses = {
+            modality: mean(
+                [value for layer in ATTENTION_LAYERS for value in mass[layer][modality]]
+            )
+            for modality in modalities
+        }
+        total = sum(modality_masses.values())
+        for modality in modalities:
+            value = modality_masses[modality]
+            share = value / total if total > 0 else 0.0
+            handle.write(f"{modality}\t{value:.10f}\t{share:.10f}\n")
+
+
 def plot_attention_analysis(feature_scores_path, output_dir):
     """Create layer/modality, layer/denoise/camera, camera/layer and per-head plots."""
     rows = load_denoise_attention_rows(feature_scores_path)
@@ -299,6 +359,7 @@ def plot_attention_analysis(feature_scores_path, output_dir):
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     modalities = attention_modalities(rows)
+    write_attention_score_tables(rows, output_dir.parent / "attention_summary_txt")
 
     # Plot 1: representative layer x modality normalized attention mass.
     layer_modality = defaultdict(lambda: defaultdict(list))
@@ -399,6 +460,11 @@ def plot_attention_analysis(feature_scores_path, output_dir):
         heads = sorted(head_values)
         if not heads:
             continue
+        expected_heads = list(range(EXPECTED_ATTENTION_HEADS))
+        if heads != expected_heads:
+            raise ValueError(
+                f"Layer {layer}: expected attention heads {expected_heads}, found {heads}"
+            )
         matrix = [
             [
                 sum(head_values[head][name]) / len(head_values[head][name])
@@ -520,7 +586,8 @@ def run_horizon(
     policy.config.n_action_steps = n_step_size
 
     try:
-        for episode in target_episodes:
+        for episode_idx, episode in enumerate(target_episodes):
+            visualize_episode = episode_idx < NUM_VISUALIZATION_EPISODES
             if hasattr(policy, "reset"):
                 policy.reset()
             indices = episode_to_indices[episode]
@@ -534,7 +601,9 @@ def run_horizon(
                 is_inference_step = local_t % n_step_size == 0
                 log_this_call = (
                     logger
-                    if is_inference_step and planning_idx % ATTENTION_INFERENCE_STRIDE == 0
+                    if visualize_episode
+                    and is_inference_step
+                    and planning_idx % ATTENTION_INFERENCE_STRIDE == 0
                     else None
                 )
                 pred = select_one_action(
@@ -569,6 +638,8 @@ def run_horizon(
 
             ep_abs = torch.cat(episode_abs)
             episode_rows.append({"episode": episode, "mae": ep_abs.mean().item(), "steps": len(indices)})
+            if not visualize_episode:
+                continue
             pred_series = torch.cat(episode_pred)
             gt_series = torch.cat(episode_gt)
             fig, axes = plt.subplots(gt_series.shape[1], 1, figsize=(16, 3 * gt_series.shape[1]), sharex=True)
@@ -582,7 +653,7 @@ def run_horizon(
                 axis.grid(True)
                 axis.legend(loc="upper right")
             axes[-1].set_xlabel("Executed dataset timestep")
-            fig.suptitle(f"Episode {episode}, chunk=50, n_step={n_step_size}")
+            fig.suptitle(f"Episode {episode}, chunk=10, n_step={n_step_size}")
             fig.tight_layout()
             fig.savefig(run_dir / f"episode_{episode}_gt_vs_pred.png", dpi=180)
             plt.close(fig)
@@ -725,9 +796,16 @@ def main():
     for idx in range(len(dataset)):
         episode_to_indices[get_episode_index(dataset[idx])].append(idx)
     episodes = sorted(episode_to_indices)
-    target_episodes = (
-        episodes if len(episodes) <= NUM_EPISODES else random.sample(episodes, NUM_EPISODES)
-    )
+    missing_required = sorted(set(REQUIRED_EPISODES) - set(episodes))
+    if missing_required:
+        raise ValueError(f"Required episode(s) not found in dataset: {missing_required}")
+    if NUM_EPISODES < len(REQUIRED_EPISODES):
+        raise ValueError("NUM_EPISODES must be >= len(REQUIRED_EPISODES)")
+    if not 0 < NUM_VISUALIZATION_EPISODES <= NUM_EPISODES:
+        raise ValueError("NUM_VISUALIZATION_EPISODES must be between 1 and NUM_EPISODES")
+    remaining = [episode for episode in episodes if episode not in REQUIRED_EPISODES]
+    extra_count = min(NUM_EPISODES - len(REQUIRED_EPISODES), len(remaining))
+    target_episodes = REQUIRED_EPISODES + random.sample(remaining, extra_count)
 
     print("checkpoint:", ckpt_dir)
     print("config:", config_path)
@@ -782,6 +860,8 @@ def main():
                 "chunk_size": policy.config.chunk_size,
                 "n_step_sizes": N_STEP_SIZES,
                 "episodes": target_episodes,
+                "visualization_episodes": target_episodes[:NUM_VISUALIZATION_EPISODES],
+                "required_episodes": REQUIRED_EPISODES,
                 "seed": RANDOM_SEED,
                 "attention_layer": TIME_PLOT_LAYER,
                 "attention_inference_stride": ATTENTION_INFERENCE_STRIDE,

@@ -1,4 +1,37 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Python/cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Logs
+logs/
+wandb/
+
+# Large experiment outputs
+outputs/
+openloop_eval/
+
+# Datasets / downloaded raw data
+domino_raw/
+domino_download/
+domino_lerobot/
+domino_lerobot_smoke/
+domino_lerobot_smoke_streaming/
+domino_lerobot_smoke_joint16/
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# General
+.DS_Store# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -165,6 +198,7 @@ wandb/
 # Data folders
 data/
 outputs/
+openloop_eval/
 
 # Translations
 *.mo
@@ -176,3 +210,4 @@ outputs/
 *.urdf
 *.xml
 *.part
+
